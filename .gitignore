@@ -1,3 +1,11 @@
 .DS_Store
 *.log
 __pycache__/
+images/
+preproc/
+depth_anything_v2/
+resize_images/
+dinos/
+bootstapir/
+test/
+

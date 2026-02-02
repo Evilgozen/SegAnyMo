@@ -261,6 +261,9 @@ def main(cfg):
         # traj: [B, 2, N, L], depth: [B, 1, H, W, L], mask: [B, 1, N, L]
         model.eval()
         pred = model(input_batch).detach().cpu()
+        
+        # 需要后景的光流
+        pred = 1 - pred
     
     thres = 0.7
     if cfg.gt_dir is not None:

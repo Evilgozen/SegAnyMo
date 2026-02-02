@@ -201,13 +201,12 @@ CUDA_VISIBLE_DEVICES=3 python train_seq.py ./configs/$CONFIG.yaml
 If you find our repo or paper useful, please cite us as:
 
 ```
-@misc{huang2025segmentmotionvideos,
-      title={Segment Any Motion in Videos}, 
-      author={Nan Huang and Wenzhao Zheng and Chenfeng Xu and Kurt Keutzer and Shanghang Zhang and Angjoo Kanazawa and Qianqian Wang},
-      year={2025},
-      eprint={2503.22268},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2503.22268}, 
+@InProceedings{Huang_2025_CVPR,
+    author    = {Huang, Nan and Zheng, Wenzhao and Xu, Chenfeng and Keutzer, Kurt and Zhang, Shanghang and Kanazawa, Angjoo and Wang, Qianqian},
+    title     = {Segment Any Motion in Videos},
+    booktitle = {Proceedings of the Computer Vision and Pattern Recognition Conference (CVPR)},
+    month     = {June},
+    year      = {2025},
+    pages     = {3406-3416}
 }
 ```
