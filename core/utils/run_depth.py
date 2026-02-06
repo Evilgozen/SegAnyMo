@@ -13,13 +13,17 @@ from PIL import Image
 from tqdm import tqdm
 from transformers import Pipeline, pipeline
 
+import sys
+sys.path.append(f'/mnt/afs/yanghongbo/My_Work/hajimi/utils')
+from redis_help import RedisHelper
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 UINT16_MAX = 65535
 
 
 models = {
-    "depth-anything": "LiheYoung/depth-anything-large-hf",
-    "depth-anything-v2": "depth-anything/Depth-Anything-V2-Large-hf",
+    "depth-anything": "/mnt/afs/share/models/depth-anything-large-hf",
+    "depth-anything-v2": "/mnt/afs/share/models/Depth-Anything-V2-Large-hf",
 }
 
 
@@ -65,12 +69,14 @@ def save_disp_from_dir(
     model_name: str,
     img_dir: str,
     out_dir: str,
+    pipe,
     matching_pattern: str = "*",
-    step: int = 10
+    step: int = 10,
 ):
     img_files = sorted(glob(osp.join(img_dir, "*.jpg"))) + sorted(
         glob(osp.join(img_dir, "*.png"))
     )
+    # print(img_files)
     img_files = [
         f for f in img_files if fnmatch.fnmatch(osp.basename(f), matching_pattern)
     ]
@@ -81,7 +87,7 @@ def save_disp_from_dir(
         print(f"Raw {model_name} depth maps already computed for {img_dir}")
         return
 
-    pipe = get_pipeline(model_name)
+    # pipe = get_pipeline(model_name)
     os.makedirs(out_dir, exist_ok=True)
     for img_file in tqdm(img_files, f"computing {model_name} depth maps"):
         disp = get_depth_anything_disp(pipe, img_file, ret_type="uint16")
@@ -206,38 +212,63 @@ def main():
         default="depth-anything-v2",
         help="depth model to use, one of [depth-anything, depth-anything-v2]",
     )
-    parser.add_argument("--img_dir", type=str, required=True)
-    parser.add_argument("--out_raw_dir", type=str, required=True)
+    parser.add_argument("--img_dir", type=str, default=None)
+    parser.add_argument("--out_raw_dir", type=str,default=None)
     parser.add_argument("--out_aligned_dir", type=str, default=None)
     parser.add_argument("--sparse_dir", type=str, default=None)
     parser.add_argument("--metric_dir", type=str, default=None)
     parser.add_argument("--matching_pattern", type=str, default="*")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument('--step', type=int,default=10)    
+
+
+    # [Fix]: 需要跑一个批量，传入对应的input_dir
+    parser.add_argument("--input_dir",type=str,default=None,help="directory contains multiple videos")
     args = parser.parse_args()
 
-    assert args.model in [
-        "depth-anything",
-        "depth-anything-v2",
-    ], f"Unknown model {args.model}"
-    save_disp_from_dir(
-        args.model, args.img_dir, args.out_raw_dir, args.matching_pattern, args.step
-    )
-    if args.sparse_dir is not None and args.out_aligned_dir is not None:
-        align_monodepth_with_colmap(
-            args.sparse_dir,
-            args.out_raw_dir,
-            args.out_aligned_dir,
-            args.matching_pattern,
-        )
+    # 优先初始化模型
+    pipe = get_pipeline(args.model)
+    
+    # 创建redis
+    redis_client = RedisHelper(redis_host='10.119.16.101', db_num=0, port=30400, redis_passwd = 'sense@123')
 
-    elif args.metric_dir is not None and args.out_aligned_dir is not None:
-        align_monodepth_with_metric_depth(
-            args.metric_dir,
-            args.out_raw_dir,
-            args.out_aligned_dir,
-            args.matching_pattern,
-        )
+    # 修改逻辑，需要将本来的直接传入img_dir 和 out_dir的逻辑变为传入input_dir然后类似dino中的处理变为loop给out_dir
+    if args.input_dir is not None:
+        # 因为历史原因，我这里选择直接修改对应的args.image_dir,因为太多使用了这个变量
+        for path in glob(os.path.join(args.input_dir,'images','*')):
+            args.img_dir = path
+            
+            if not redis_client.set(f"{path.split('/')[-1]}0205-02-depth",1):
+                print(f'{path.split("/")[-1]}已经处理过')
+                continue
+
+            # 修改对应的out_raw_dir
+            # 类似dino处理获取大的save_dir
+            args.out_raw_dir = os.path.join(os.path.dirname(os.path.dirname(args.img_dir)), "depth_anything_v2", os.path.basename(args.img_dir))
+
+            # print(f'测试input{args.img_dir}   测试output{args.out_raw_dir}')
+            assert args.model in [
+                "depth-anything",
+                "depth-anything-v2",
+            ], f"Unknown model {args.model}"
+            save_disp_from_dir(
+                args.model, args.img_dir, args.out_raw_dir, pipe, args.matching_pattern, args.step
+            )
+            if args.sparse_dir is not None and args.out_aligned_dir is not None:
+                align_monodepth_with_colmap(
+                    args.sparse_dir,
+                    args.out_raw_dir,
+                    args.out_aligned_dir,
+                    args.matching_pattern,
+                )
+
+            elif args.metric_dir is not None and args.out_aligned_dir is not None:
+                align_monodepth_with_metric_depth(
+                    args.metric_dir,
+                    args.out_raw_dir,
+                    args.out_aligned_dir,
+                    args.matching_pattern,
+                )
 
 
 if __name__ == "__main__":
