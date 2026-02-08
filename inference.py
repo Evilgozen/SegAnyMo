@@ -1,4 +1,5 @@
 import os
+import io
 import shutil
 import argparse
 import torch
@@ -18,6 +19,22 @@ from core.network.transfomer import traj_seg
 from filelock import FileLock
 from train_seq import setup_model
 import h5py
+
+import sys
+sys.path.append('/mnt/afs/yanghongbo/My_Work/hajimi/utils')
+from aoss_help import AOSS_Client
+
+AOSS_CONF_PATH = '/mnt/afs/yanghongbo/My_Work/hajimi/utils/aoss.conf'
+S3_BUCKET_PREFIX = 's3://yanghongbo/ylr-data/P02/SAM_M'
+
+_aoss_client = None
+
+def get_aoss_client():
+    """全局单例，懒初始化 AOSS_Client（避免序列化问题）"""
+    global _aoss_client
+    if _aoss_client is None:
+        _aoss_client = AOSS_Client(AOSS_CONF_PATH, 'aoss')
+    return _aoss_client
 
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
@@ -284,8 +301,9 @@ def main(cfg):
             mean_iou = sum(existing_data.values()) / len(existing_data)
             existing_data['mean_iou'] = mean_iou
 
-            with open(doc_path, 'w') as json_file:
-                json.dump(existing_data, json_file)
+            json_bytes = json.dumps(existing_data).encode('utf-8')
+            s3_path = f"{S3_BUCKET_PREFIX}/{doc_path}"
+            get_aoss_client().put_data(s3_path, json_bytes)
 
         pred_np = pred.cpu().numpy()
         label_np = traj_label_t.cpu().numpy()
@@ -307,7 +325,10 @@ def main(cfg):
             all_preds = np.concatenate((all_preds, new_pred))
             all_labels = np.concatenate((all_labels, new_label))
 
-            np.savez(roc_file_path, all_preds=all_preds, all_labels=all_labels)        
+            buf = io.BytesIO()
+            np.savez(buf, all_preds=all_preds, all_labels=all_labels)
+            s3_path = f"{S3_BUCKET_PREFIX}/{roc_file_path}"
+            get_aoss_client().put_data(s3_path, buf.getvalue())
     
     min_num = 3
     thresholds = [0.95, 0.93, 0.9, 0.85, 0.8, 0.75, 0.7]
@@ -336,10 +357,15 @@ def main(cfg):
     dynamic_traj = (track.squeeze(0)) [:, d_mask, :]
     d_visibility = (visible_mask)[d_mask, :]
     d_confidences = (confidences)[d_mask, :]
-    np.save(os.path.join(seq_save_dir, "dynamic_confidences.npy"), d_confidences)
-    # [2, N, T] and [N, T]
-    np.save(os.path.join(seq_save_dir, "dynamic_traj.npy"), dynamic_traj)
-    np.save(os.path.join(seq_save_dir, "dynamic_visibility.npy"), d_visibility)
+    for fname, data in [
+        ("dynamic_confidences.npy", d_confidences),
+        ("dynamic_traj.npy", dynamic_traj),
+        ("dynamic_visibility.npy", d_visibility),
+    ]:
+        buf = io.BytesIO()
+        np.save(buf, data)
+        s3_path = f"{S3_BUCKET_PREFIX}/{os.path.join(seq_save_dir, fname)}"
+        get_aoss_client().put_data(s3_path, buf.getvalue())
 
     # vis
     # vis = Visualizer(save_dir=seq_save_dir, pad_value=100)

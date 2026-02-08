@@ -1,5 +1,6 @@
 import math
 import os
+import io
 import sys
 import types
 from typing import List, Tuple, Union
@@ -14,6 +15,21 @@ from torchvision import transforms
 from tqdm import trange
 from glob import glob
 import imageio as iio
+
+sys.path.append('/mnt/afs/yanghongbo/My_Work/hajimi/utils')
+from aoss_help import AOSS_Client
+
+AOSS_CONF_PATH = '/mnt/afs/yanghongbo/My_Work/hajimi/utils/aoss.conf'
+S3_BUCKET_PREFIX = 's3://yanghongbo/ylr-data/P02/SAM_M'
+
+_aoss_client = None
+
+def get_aoss_client():
+    """全局单例，懒初始化 AOSS_Client（避免序列化问题）"""
+    global _aoss_client
+    if _aoss_client is None:
+        _aoss_client = AOSS_Client(AOSS_CONF_PATH, 'aoss')
+    return _aoss_client
 
 def extract_and_save_features(
     input_img_path_list: List[str],
@@ -77,7 +93,10 @@ def extract_and_save_features(
         ).squeeze()
         descriptors = descriptors.cpu().detach().numpy()
         if not file_exists:
-            np.save(feat_pth, descriptors.astype(np.float16))
+            buf = io.BytesIO()
+            np.save(buf, descriptors.astype(np.float16))
+            s3_path = f"{S3_BUCKET_PREFIX}/{feat_pth}"
+            get_aoss_client().put_data(s3_path, buf.getvalue())
     del extractor
     # clear the cache
     torch.cuda.empty_cache()
@@ -534,7 +553,7 @@ def process_single_dir(image_dir, args):
     
     extract_and_save_features(
         img_paths, save_paths, (H, W),
-        args.stride, args.model_type
+        args.stride, args.model_type,
     )
 
 

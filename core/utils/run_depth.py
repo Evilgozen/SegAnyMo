@@ -1,5 +1,6 @@
 import argparse
 import fnmatch
+import io
 import os
 import os.path as osp
 from glob import glob
@@ -16,6 +17,19 @@ from transformers import Pipeline, pipeline
 import sys
 sys.path.append(f'/mnt/afs/yanghongbo/My_Work/hajimi/utils')
 from redis_help import RedisHelper
+from aoss_help import AOSS_Client
+
+AOSS_CONF_PATH = '/mnt/afs/yanghongbo/My_Work/hajimi/utils/aoss.conf'
+S3_BUCKET_PREFIX = 's3://yanghongbo/ylr-data/P02/SAM_M'
+
+_aoss_client = None
+
+def get_aoss_client():
+    """全局单例，懒初始化 AOSS_Client（避免序列化问题）"""
+    global _aoss_client
+    if _aoss_client is None:
+        _aoss_client = AOSS_Client(AOSS_CONF_PATH, 'aoss')
+    return _aoss_client
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 UINT16_MAX = 65535
@@ -92,7 +106,10 @@ def save_disp_from_dir(
     for img_file in tqdm(img_files, f"computing {model_name} depth maps"):
         disp = get_depth_anything_disp(pipe, img_file, ret_type="uint16")
         out_file = osp.join(out_dir, osp.splitext(osp.basename(img_file))[0] + ".png")
-        iio.imwrite(out_file, disp)
+        success, buf = cv2.imencode('.png', disp)
+        if success:
+            s3_path = f"{S3_BUCKET_PREFIX}/{out_file}"
+            get_aoss_client().put_data(s3_path, buf.tobytes())
 
 
 def align_monodepth_with_metric_depth(
@@ -130,7 +147,10 @@ def align_monodepth_with_metric_depth(
         # set depth values that are too small to invalid (0)
         aligned_disp[aligned_disp < min_thre] = 0.0
         out_file = osp.join(output_monodepth_dir, imname + ".npy")
-        np.save(out_file, aligned_disp)
+        buf = io.BytesIO()
+        np.save(buf, aligned_disp)
+        s3_path = f"{S3_BUCKET_PREFIX}/{out_file}"
+        get_aoss_client().put_data(s3_path, buf.getvalue())
 
 
 def align_monodepth_with_colmap(
@@ -198,10 +218,11 @@ def align_monodepth_with_colmap(
         min_thre = min(1e-6, np.quantile(mono_disp_aligned, 0.01))
         # set depth values that are too small to invalid (0)
         mono_disp_aligned[mono_disp_aligned < min_thre] = 0.0
-        np.save(
-            osp.join(output_monodepth_dir, image.name.split(".")[0] + ".npy"),
-            mono_disp_aligned,
-        )
+        out_file = osp.join(output_monodepth_dir, image.name.split(".")[0] + ".npy")
+        buf = io.BytesIO()
+        np.save(buf, mono_disp_aligned)
+        s3_path = f"{S3_BUCKET_PREFIX}/{out_file}"
+        get_aoss_client().put_data(s3_path, buf.getvalue())
 
 
 def main():
@@ -252,7 +273,7 @@ def main():
                 "depth-anything-v2",
             ], f"Unknown model {args.model}"
             save_disp_from_dir(
-                args.model, args.img_dir, args.out_raw_dir, pipe, args.matching_pattern, args.step
+                args.model, args.img_dir, args.out_raw_dir, pipe, args.matching_pattern, args.step,
             )
             if args.sparse_dir is not None and args.out_aligned_dir is not None:
                 align_monodepth_with_colmap(
