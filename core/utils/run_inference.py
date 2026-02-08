@@ -118,6 +118,10 @@ def main(
         data_dir = os.path.dirname(img_dirs_root)
         img_names = sorted(os.listdir(img_dirs_root))
     
+    # 多机分片：每台机器只处理自己分到的 img_names
+    img_names = img_names[args.rank::args.world_size]
+    print(f'[机器 {args.rank}/{args.world_size}] main阶段分配任务数: {len(img_names)}')
+    
     with ProcessPoolExecutor(max_workers=len(gpus)) as exe:
         # for i, img_name in enumerate(img_names):  # 是否为所有的img的处理结果？
         for i in range(len(gpus)): # 因为思路准确直接硬编码
@@ -259,6 +263,9 @@ if __name__ == "__main__":
 
     # [Fix]: 提供对应的批量处理方法
     parser.add_argument("--input_dir",type=str,default=None,help="directory contains multiple videos")
+    # [Fix]: 多机分片参数
+    parser.add_argument("--rank", type=int, default=0, help="当前机器编号 (0-indexed)")
+    parser.add_argument("--world_size", type=int, default=1, help="总机器数量")
     args = parser.parse_args()
 
     sys.path.append('/mnt/afs/yanghongbo/My_Work/hajimi/utils')
@@ -281,18 +288,27 @@ if __name__ == "__main__":
         os.makedirs(img_root,exist_ok=True)
 
         # 创建redis用于去重校验
-        redis_client = RedisHelper(redis_host='10.119.16.101', db_num=0, port=30400, redis_passwd='sense@123')
+        redis_client = RedisHelper(redis_host='10.119.7.77', db_num=0, port=6379, redis_passwd='')
 
-        # 收集需要处理的视频任务（通过redis去重）
+        # 收集所有视频文件并排序（保证每台机器看到的顺序一致）
+        all_videos = sorted([
+            path for path in glob.glob(os.path.join(args.input_dir, '*'))
+            if os.path.isfile(path) and path.lower().endswith(valid_video_exts)
+        ])
+
+        # 按 rank/world_size 静态分片，每台机器只处理自己的那份
+        my_videos = all_videos[args.rank::args.world_size]
+        print(f'[机器 {args.rank}/{args.world_size}] 总视频数: {len(all_videos)}, 本机分配: {len(my_videos)}')
+
+        # 收集需要处理的视频任务（Redis 做二次去重，可选）
         tasks = []
-        for path in glob.glob(os.path.join(args.input_dir,'*')):
-            if os.path.isfile(path) and path.lower().endswith(valid_video_exts):
-                seq_name = os.path.splitext(os.path.basename(path))[0]
-                output_dir = os.path.join(img_root, seq_name)
-                if not redis_client.set(f"{seq_name}0208-02-images", 1):
-                    print(f'{seq_name} 已经处理过，跳过拆帧')
-                    continue
-                tasks.append((path, output_dir, args.e))
+        for path in my_videos:
+            seq_name = os.path.splitext(os.path.basename(path))[0]
+            output_dir = os.path.join(img_root, seq_name)
+            if not redis_client.set(f"{seq_name}0205-02-frames", 1):
+                print(f'{seq_name} 已经处理过，跳过拆帧')
+                continue
+            tasks.append((path, output_dir, args.e))
 
         # 多进程并行拆帧
         if tasks:

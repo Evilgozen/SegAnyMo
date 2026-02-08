@@ -230,7 +230,7 @@ def main():
     pipe = get_pipeline(args.model)
     
     # 创建redis
-    redis_client = RedisHelper(redis_host='127.0.0.1', db_num=0, port=6379, redis_passwd='')
+    redis_client = RedisHelper(redis_host='10.119.7.77', db_num=0, port=6379, redis_passwd='')
 
     # 修改逻辑，需要将本来的直接传入img_dir 和 out_dir的逻辑变为传入input_dir然后类似dino中的处理变为loop给out_dir
     if args.input_dir is not None:

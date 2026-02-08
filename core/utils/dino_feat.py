@@ -552,7 +552,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     # 创建redis
-    redis_client = RedisHelper(redis_host='127.0.0.1', db_num=0, port=6379, redis_passwd='')
+    redis_client = RedisHelper(redis_host='10.119.7.77', db_num=0, port=6379, redis_passwd='')
 
     if args.input_dir is not None:
         # 批量处理模式：遍历input_dir/images/*下的所有子目录
