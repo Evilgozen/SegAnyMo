@@ -504,39 +504,71 @@ class ViTExtractor:
         )  # normalize to range [0,1]
         return cls_attn_maps
 
-if __name__=='__main__':
-    parser = argparse.ArgumentParser(description='Train trajectory-based motion segmentation network',
-                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--image_dir', type=str, default="current-data-dir/davis/DAVIS/moving/480p/boat")
+def process_single_dir(image_dir, args):
+    """处理单个图像目录"""
+    img_paths_all = sorted(glob(os.path.join(image_dir, "*.png"))) + sorted(
+        glob(os.path.join(image_dir, "*.jpg")) + sorted(glob(os.path.join(image_dir, "*.jpeg")))
+    )
+    if len(img_paths_all) == 0:
+        print(f"No images found in {image_dir}, skipping...")
+        return
+        
+    num_frames = len(img_paths_all)
+    q_ts = list(range(0, num_frames, args.step))
+    img_paths = [img_paths_all[q] for q in q_ts]
+    
+    save_dir = os.path.join(os.path.dirname(os.path.dirname(image_dir)), "dinos", os.path.basename(image_dir))
+    if os.path.exists(save_dir):
+        print(f"{save_dir} already exists. Skipping...")
+        return
+    os.makedirs(save_dir, exist_ok=True)
+    
+    frame_names = [os.path.splitext(os.path.basename(p))[0] for p in img_paths]
+    save_paths = [os.path.join(save_dir, f"{n}.npy") for n in frame_names]
+
+    img = torch.from_numpy(np.array([iio.imread(img_paths[0])])).squeeze().permute(2, 0, 1)
+    H, W = img.shape[1], img.shape[2]
+    # has to be divided by 14
+    H = (H + 13) // 14 * 14
+    W = (W + 13) // 14 * 14
+    
+    extract_and_save_features(
+        img_paths, save_paths, (H, W),
+        args.stride, args.model_type
+    )
+
+
+if __name__ == '__main__':
+    sys.path.append('/mnt/afs/yanghongbo/My_Work/hajimi/utils')
+    from redis_help import RedisHelper
+    
+    parser = argparse.ArgumentParser(description='Extract DINO features from images',
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--image_dir', type=str, default=None, help="Single image directory to process")
+    parser.add_argument('--input_dir', type=str, default=None, help="Directory containing multiple video folders (with images subdirectory)")
     parser.add_argument('--model_type', type=str, default="dinov2_vitb14")
     parser.add_argument('--stride', type=int, default=7)
     parser.add_argument('--step', type=int, default=10)
     args = parser.parse_args()
 
-    img_paths_all = sorted(glob(os.path.join(args.image_dir, "*.png"))) + sorted(
-        glob(os.path.join(args.image_dir, "*.jpg")) + sorted(glob(os.path.join(args.image_dir, "*.jpeg")))
-    )
-    num_frames = len(img_paths_all)
-    q_ts = list(range(0, num_frames, args.step))
-    img_paths = [img_paths_all[q] for q in q_ts]
-    
-    save_dir = os.path.join(os.path.dirname(os.path.dirname(args.image_dir)), "dinos", os.path.basename(args.image_dir))
-    if os.path.exists(save_dir):
-        print(f"{save_dir} already exists. Exiting...")
-        sys.exit()
-    os.makedirs(save_dir, exist_ok=True)
-    
-    frame_names = [os.path.splitext(os.path.basename(p))[0] for p in img_paths]
+    # 创建redis
+    redis_client = RedisHelper(redis_host='127.0.0.1', db_num=0, port=6379, redis_passwd='')
 
-    save_paths = [os.path.join(save_dir,f"{n}.npy") for n in frame_names]
-
-    img = torch.from_numpy(np.array([iio.imread(img_paths[0])])).squeeze().permute(2, 0, 1) # [1, 512, 512, 3]
-    H,W = img.shape[1], img.shape[2]
-    # has to be divided by 14
-    H = (H + 13) // 14 * 14
-    W = (W + 13) // 14 * 14
+    if args.input_dir is not None:
+        # 批量处理模式：遍历input_dir/images/*下的所有子目录
+        for path in glob(os.path.join(args.input_dir, 'images', '*')):
+            video_name = path.split('/')[-1]
+            
+            if not redis_client.set(f"{video_name}0205-02-dino", 1):
+                print(f'{video_name}已经处理过')
+                continue
+            
+            process_single_dir(path, args)
     
-    return_dict = extract_and_save_features(
-        img_paths, save_paths, (H, W),
-        args.stride, args.model_type
-        )
+    elif args.image_dir is not None:
+        # 单目录处理模式（兼容原有逻辑）
+        process_single_dir(args.image_dir, args)
+    
+    else:
+        print("Error: Please provide either --image_dir or --input_dir")
+        sys.exit(1)
