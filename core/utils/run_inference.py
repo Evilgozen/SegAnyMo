@@ -5,6 +5,7 @@ from concurrent.futures import ProcessPoolExecutor
 import argparse
 import glob
 import cv2
+import sys
 
 def resize_images(input_dir, output_dir):    
     valid_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
@@ -260,6 +261,9 @@ if __name__ == "__main__":
     parser.add_argument("--input_dir",type=str,default=None,help="directory contains multiple videos")
     args = parser.parse_args()
 
+    sys.path.append('/mnt/afs/yanghongbo/My_Work/hajimi/utils')
+    from redis_help import RedisHelper
+
     print(f'[Debug]:{args.e}')
     if args.e:
         print(f'已经开启了efficient模式')
@@ -274,18 +278,38 @@ if __name__ == "__main__":
         valid_video_exts = ('.mp4', '.mov', '.avi', '.mkv', '.webm')
         # 尝试构建一个 '/image/{name}' 的结构进行批量结果的存储
         img_root = os.path.join(args.input_dir,'images')
-        # print(f'[Debug]:是否有对应的运行')
         os.makedirs(img_root,exist_ok=True)
 
-        # 需要获取其中的所有文件然后进行后续的存储的重构
+        # 创建redis用于去重校验
+        redis_client = RedisHelper(redis_host='10.119.16.101', db_num=0, port=30400, redis_passwd='sense@123')
+
+        # 收集需要处理的视频任务（通过redis去重）
+        tasks = []
         for path in glob.glob(os.path.join(args.input_dir,'*')):
             if os.path.isfile(path) and path.lower().endswith(valid_video_exts):
                 seq_name = os.path.splitext(os.path.basename(path))[0]
                 output_dir = os.path.join(img_root, seq_name)
+                if not redis_client.set(f"{seq_name}0208-02-images", 1):
+                    print(f'{seq_name} 已经处理过，跳过拆帧')
+                    continue
+                tasks.append((path, output_dir, args.e))
 
-                if not os.path.exists(output_dir):
-                    video_to_images(path, output_dir, args.e)
-        
+        # 多进程并行拆帧
+        if tasks:
+            num_workers = min(len(tasks), os.cpu_count() or 4)
+            print(f'使用 {num_workers} 个进程并行处理 {len(tasks)} 个视频')
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(video_to_images, vpath, odir, eff): vpath
+                    for vpath, odir, eff in tasks
+                }
+                for future in futures:
+                    try:
+                        future.result()
+                        print(f'完成: {os.path.basename(futures[future])}')
+                    except Exception as e:
+                        print(f'失败: {os.path.basename(futures[future])}, 错误: {e}')
+
         # 最终传递的是一个root的路径，下面有对应的
         args.data_dir = img_root
         
