@@ -1,3 +1,4 @@
+import io
 import os
 import subprocess
 from concurrent.futures import ProcessPoolExecutor
@@ -5,46 +6,89 @@ from concurrent.futures import ProcessPoolExecutor
 import argparse
 import glob
 import cv2
+import numpy as np
 import sys
+
+sys.path.append('/mnt/afs/yanghongbo/My_Work/hajimi/utils')
+from aoss_help import AOSS_Client
+
+AOSS_CONF_PATH = '/mnt/afs/yanghongbo/My_Work/hajimi/utils/aoss.conf'
+S3_BUCKET_PREFIX = 's3://yanghongbo/ylr-data/P02/SAM_M'
+
+_aoss_client = None
+
+def get_aoss_client():
+    """全局单例，懒初始化 AOSS_Client（避免序列化问题）"""
+    global _aoss_client
+    if _aoss_client is None:
+        _aoss_client = AOSS_Client(AOSS_CONF_PATH, 'aoss')
+    return _aoss_client
+
+def aoss_list_files(dir_path):
+    """从 AOSS 列举指定目录下的所有文件路径
+    get_Bucket_list 返回的是子项名称，需要和目录前缀拼接成完整路径
+    """
+    s3_dir = f"yanghongbo/ylr-data/P02/SAM_M/{dir_path}"
+    items = get_aoss_client().get_Bucket_list(s3_dir)
+    prefix = s3_dir.rstrip('/') + '/'
+    return sorted([prefix + item for item in items])
+
+def aoss_read_image_cv2(s3_full_path):
+    """从 AOSS 读取图片并返回 cv2 BGR numpy array
+    s3_full_path: 完整的 S3 路径（不含 s3:// 前缀）
+    """
+    img_bytes = get_aoss_client().get_path2data(f"s3://{s3_full_path}")
+    img_arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    return cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
 
 def resize_images(input_dir, output_dir):    
     valid_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
     
-    for seq in os.listdir(input_dir):
-        seq_in_dir = os.path.join(input_dir, seq)
+    # 从 S3 列举 input_dir 下所有文件，按子目录分组
+    all_files = aoss_list_files(input_dir)
+    # 按第一级子目录分组
+    seq_files = {}
+    prefix = input_dir.rstrip('/') + '/'
+    for f in all_files:
+        rel = f[len(prefix):] if f.startswith(prefix) else os.path.basename(f)
+        parts = rel.split('/')
+        if len(parts) >= 2:
+            seq = parts[0]
+            filename = parts[-1]
+            seq_files.setdefault(seq, []).append((filename, f))
+    
+    for seq, files in seq_files.items():
         seq_out_dir = os.path.join(output_dir, seq)
-        if not os.path.exists(seq_out_dir):
-            os.makedirs(seq_out_dir, exist_ok=True)
-
-            for filename in os.listdir(seq_in_dir):
-                if filename.lower().endswith(valid_exts):
-                    input_path = os.path.join(seq_in_dir, filename)
-                    output_path = os.path.join(seq_out_dir, filename)
+        for filename, full_path in files:
+            if filename.lower().endswith(valid_exts):
+                output_path = os.path.join(seq_out_dir, filename)
+                
+                img = aoss_read_image_cv2(full_path)
+                if img is None:
+                    continue
                     
-                    img = cv2.imread(input_path)
-                    if img is None:
-                        continue
-                        
-                    h, w = img.shape[:2]
+                h, w = img.shape[:2]
+                
+                max_dim = max(h, w)
+                if max_dim > 1000:
+                    scale = 1000 / max_dim
+                    new_w = int(w * scale)
+                    new_h = int(h * scale)
+                else:
+                    new_w = w
+                    new_h = h
                     
-                    max_dim = max(h, w)
-                    if max_dim > 1000:
-                        scale = 1000 / max_dim
-                        new_w = int(w * scale)
-                        new_h = int(h * scale)
-                    else:
-                        new_w = w
-                        new_h = h
-                        
-                    resized_img = cv2.resize(img, (new_w, new_h), 
-                                        interpolation=cv2.INTER_AREA)
-                     
-                    cv2.imwrite(output_path, resized_img)
+                resized_img = cv2.resize(img, (new_w, new_h), 
+                                    interpolation=cv2.INTER_AREA)
+                 
+                # 上传到 AOSS
+                success, buf = cv2.imencode('.png', resized_img)
+                if success:
+                    s3_out = f"{S3_BUCKET_PREFIX}/{output_path}"
+                    get_aoss_client().put_data(s3_out, buf.tobytes())
 
 def video_to_images(video_path, output_dir, efficiency):
     if video_path is not None:
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
         
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -85,7 +129,10 @@ def video_to_images(video_path, output_dir, efficiency):
                 or (not efficiency and saved_frame_count < target_frames):
                 
                 image_path = os.path.join(output_dir, f"{saved_frame_count:05d}.png")
-                cv2.imwrite(image_path, frame)
+                success, buf = cv2.imencode('.png', frame)
+                if success:
+                    s3_path = f"{S3_BUCKET_PREFIX}/{image_path}"
+                    get_aoss_client().put_data(s3_path, buf.tobytes())
                 saved_frame_count += 1
             
             frame_count += 1
@@ -107,16 +154,42 @@ def main(
         stereo = True
         dataset = "dynamic_stereo"
         data_dir = args.data_dir
-        img_names = sorted([os.path.splitext(f)[0] for f in os.listdir(data_dir) if not f.endswith('.json')])
+        # 从 S3 列举子目录名
+        all_s3 = aoss_list_files(data_dir)
+        prefix = data_dir.rstrip('/') + '/'
+        names = set()
+        for f in all_s3:
+            rel = f[len(prefix):] if f.startswith(prefix) else f
+            parts = rel.split('/')
+            if parts[0] and not parts[0].endswith('.json'):
+                names.add(os.path.splitext(parts[0])[0])
+        img_names = sorted(names)
     elif "waymo" in args.data_dir:
         waymo = True
         data_dir = args.data_dir
-        img_names = sorted([os.path.splitext(f)[0] for f in os.listdir(data_dir) if not f.endswith('.json')])
+        all_s3 = aoss_list_files(data_dir)
+        prefix = data_dir.rstrip('/') + '/'
+        names = set()
+        for f in all_s3:
+            rel = f[len(prefix):] if f.startswith(prefix) else f
+            parts = rel.split('/')
+            if parts[0] and not parts[0].endswith('.json'):
+                names.add(os.path.splitext(parts[0])[0])
+        img_names = sorted(names)
     # davis, kubric, HOI4D and in-the-wild data
     else:
         img_dirs_root = args.data_dir
         data_dir = os.path.dirname(img_dirs_root)
-        img_names = sorted(os.listdir(img_dirs_root))
+        # 从 S3 列举 images/ 下的子目录名
+        all_s3 = aoss_list_files(img_dirs_root)
+        prefix = img_dirs_root.rstrip('/') + '/'
+        seq_names = set()
+        for f in all_s3:
+            rel = f[len(prefix):] if f.startswith(prefix) else f
+            parts = rel.split('/')
+            if len(parts) >= 2:
+                seq_names.add(parts[0])
+        img_names = sorted(seq_names)
     
     # 多机分片：每台机器只处理自己分到的 img_names
     img_names = img_names[args.rank::args.world_size]
@@ -335,7 +408,9 @@ if __name__ == "__main__":
         seq_name = os.path.splitext(os.path.basename(args.video_path))[0]
         img_dir = os.path.join(os.path.dirname(args.video_path), 'images')
         output_dir = os.path.join(img_dir, seq_name)
-        if not os.path.exists(output_dir):
+        # 检查 S3 上是否已有拆帧结果
+        s3_check = aoss_list_files(output_dir)
+        if len(s3_check) == 0:
             video_to_images(args.video_path, output_dir, args.e)
         args.data_dir = img_dir
         # if efficiency, change resolution

@@ -29,6 +29,27 @@ def get_aoss_client():
     return _aoss_client
 
 
+def aoss_list_files(dir_path):
+    """从 AOSS 列举指定目录下的文件路径列表
+    get_Bucket_list 返回的是子项名称，需要和目录前缀拼接成完整路径
+    """
+    s3_dir = f"yanghongbo/ylr-data/P02/SAM_M/{dir_path}"
+    items = get_aoss_client().get_Bucket_list(s3_dir)
+    prefix = s3_dir.rstrip('/') + '/'
+    return sorted([prefix + item for item in items])
+
+
+def aoss_read_image_np(s3_full_path):
+    """从 AOSS 读取图片并返回 numpy array (HWC, uint8, RGB)
+    s3_full_path: 完整的 S3 路径（不含 s3:// 前缀）
+    """
+    img_bytes = get_aoss_client().get_path2data(f"s3://{s3_full_path}")
+    img_arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    import cv2
+    img = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
 def load_model(args):
     ## Load model
     ckpt_file = (
@@ -44,8 +65,8 @@ def load_model(args):
     return model,device
 
 def read_video(folder_path):
-    frame_paths = sorted(glob.glob(os.path.join(folder_path, "*")))
-    video = np.stack([imageio.imread(frame_path) for frame_path in frame_paths])
+    frame_paths = aoss_list_files(folder_path)
+    video = np.stack([aoss_read_image_np(frame_path) for frame_path in frame_paths])
     print(f"{video.shape=} {video.dtype=} {video.min()=} {video.max()=}")
     video = media._VideoArray(video)
     return video
@@ -111,20 +132,17 @@ def main():
             folder_path = args.image_dir
             # mask_dir = args.mask_dir
             frame_names = [
-                os.path.basename(f) for f in sorted(glob.glob(os.path.join(folder_path, "*")))
+                os.path.basename(f) for f in aoss_list_files(folder_path)
             ]
             out_dir = args.out_dir
             os.makedirs(out_dir, exist_ok=True)
 
-            done = True
-            for t in range(len(frame_names)):
-                for j in range(len(frame_names)):
-                    name_t = os.path.splitext(frame_names[t])[0]
-                    name_j = os.path.splitext(frame_names[j])[0]
-                    out_path = f"{out_dir}/{name_t}_{name_j}.npy"
-                    if not os.path.exists(out_path):
-                        done = False
-                        break
+            # 检查 S3 上是否已完成
+            s3_out_check = f"yanghongbo/ylr-data/P02/SAM_M/{out_dir}"
+            existing_npys = get_aoss_client().get_Bucket_list(s3_out_check)
+            expected_count = len(frame_names) * len(frame_names)
+            npy_count = len([f for f in existing_npys if f.endswith('.npy')]) if existing_npys else 0
+            done = (npy_count >= expected_count)
             print(f"{done=}")
             if done:
                 print("Already done")
@@ -162,8 +180,11 @@ def main():
             
             for t in tqdm(q_ts, desc="query frames"):
                 name_t = os.path.splitext(frame_names[t])[0]
-                file_matches = glob.glob(f"{out_dir}/{name_t}_*.npy")
-                if len(file_matches) == num_frames:
+                # 检查 S3 上该 query frame 的 track 是否已完成
+                s3_qt_dir = f"yanghongbo/ylr-data/P02/SAM_M/{out_dir}"
+                qt_files = get_aoss_client().get_Bucket_list(s3_qt_dir) or []
+                qt_matches = [f for f in qt_files if f.startswith(f"{name_t}_") and f.endswith('.npy')]
+                if len(qt_matches) == num_frames:
                     print(f"Already computed tracks with query {t=} {name_t=}")
                     continue
 

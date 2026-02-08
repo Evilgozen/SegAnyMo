@@ -31,6 +31,40 @@ def get_aoss_client():
         _aoss_client = AOSS_Client(AOSS_CONF_PATH, 'aoss')
     return _aoss_client
 
+
+def aoss_list_images(image_dir):
+    """从 AOSS 列举指定目录下的图片文件路径列表
+    get_Bucket_list 返回的是子项名称，需要和目录前缀拼接成完整路径
+    """
+    s3_dir = f"yanghongbo/ylr-data/P02/SAM_M/{image_dir}"
+    items = get_aoss_client().get_Bucket_list(s3_dir)
+    valid_exts = ('.png', '.jpg', '.jpeg')
+    prefix = s3_dir.rstrip('/') + '/'
+    paths = sorted([
+        prefix + item for item in items
+        if any(item.lower().endswith(ext) for ext in valid_exts)
+    ])
+    return paths
+
+
+def aoss_read_image_pil(s3_full_path):
+    """从 AOSS 读取图片并返回 PIL Image
+    s3_full_path: 完整的 S3 路径（不含 s3:// 前缀）
+    """
+    img_bytes = get_aoss_client().get_path2data(f"s3://{s3_full_path}")
+    return Image.open(io.BytesIO(img_bytes))
+
+
+def aoss_read_image_np(s3_full_path):
+    """从 AOSS 读取图片并返回 numpy array (HWC, uint8)
+    s3_full_path: 完整的 S3 路径（不含 s3:// 前缀）
+    """
+    img_bytes = get_aoss_client().get_path2data(f"s3://{s3_full_path}")
+    img_arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    import cv2
+    img = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
 def extract_and_save_features(
     input_img_path_list: List[str],
     saved_feat_path_list: List[str],
@@ -79,7 +113,7 @@ def extract_and_save_features(
         if file_exists:
             continue
         os.makedirs(os.path.dirname(feat_pth), exist_ok=True)
-        images = [prep(Image.open(image_pth).convert("RGB"))]
+        images = [prep(aoss_read_image_pil(image_pth).convert("RGB"))]
         preproc_image_lst = torch.stack(images, dim=0).to("cuda")
         with torch.no_grad():
             descriptors = extractor.extract_descriptors(
@@ -525,9 +559,7 @@ class ViTExtractor:
 
 def process_single_dir(image_dir, args):
     """处理单个图像目录"""
-    img_paths_all = sorted(glob(os.path.join(image_dir, "*.png"))) + sorted(
-        glob(os.path.join(image_dir, "*.jpg")) + sorted(glob(os.path.join(image_dir, "*.jpeg")))
-    )
+    img_paths_all = aoss_list_images(image_dir)
     if len(img_paths_all) == 0:
         print(f"No images found in {image_dir}, skipping...")
         return
@@ -537,15 +569,20 @@ def process_single_dir(image_dir, args):
     img_paths = [img_paths_all[q] for q in q_ts]
     
     save_dir = os.path.join(os.path.dirname(os.path.dirname(image_dir)), "dinos", os.path.basename(image_dir))
-    if os.path.exists(save_dir):
-        print(f"{save_dir} already exists. Skipping...")
+    # 检查 S3 上是否已存在
+    s3_check_dir = f"yanghongbo/ylr-data/P02/SAM_M/{save_dir}"
+    existing = get_aoss_client().get_Bucket_list(s3_check_dir) or []
+    if len(existing) > 0:
+        print(f"{save_dir} already exists on S3. Skipping...")
         return
     os.makedirs(save_dir, exist_ok=True)
     
     frame_names = [os.path.splitext(os.path.basename(p))[0] for p in img_paths]
     save_paths = [os.path.join(save_dir, f"{n}.npy") for n in frame_names]
 
-    img = torch.from_numpy(np.array([iio.imread(img_paths[0])])).squeeze().permute(2, 0, 1)
+    # 从 AOSS 读取第一张图片获取尺寸
+    first_img = aoss_read_image_np(img_paths[0])
+    img = torch.from_numpy(first_img).permute(2, 0, 1)
     H, W = img.shape[1], img.shape[2]
     # has to be divided by 14
     H = (H + 13) // 14 * 14

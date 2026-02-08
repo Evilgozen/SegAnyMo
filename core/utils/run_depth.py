@@ -31,6 +31,38 @@ def get_aoss_client():
         _aoss_client = AOSS_Client(AOSS_CONF_PATH, 'aoss')
     return _aoss_client
 
+
+def aoss_list_images(image_dir):
+    """从 AOSS 列举指定目录下的图片文件路径列表
+    get_Bucket_list 返回的是子项名称，需要和目录前缀拼接成完整路径
+    """
+    s3_dir = f"yanghongbo/ylr-data/P02/SAM_M/{image_dir}"
+    items = get_aoss_client().get_Bucket_list(s3_dir)
+    valid_exts = ('.png', '.jpg', '.jpeg')
+    prefix = s3_dir.rstrip('/') + '/'
+    paths = sorted([
+        prefix + item for item in items
+        if any(item.lower().endswith(ext) for ext in valid_exts)
+    ])
+    return paths
+
+
+def aoss_read_image_pil(s3_full_path):
+    """从 AOSS 读取图片并返回 PIL Image
+    s3_full_path: 完整的 S3 路径（不含 s3:// 前缀）
+    """
+    img_bytes = get_aoss_client().get_path2data(f"s3://{s3_full_path}")
+    return Image.open(io.BytesIO(img_bytes))
+
+
+def aoss_read_image_raw(s3_full_path):
+    """从 AOSS 读取图片并返回原始 numpy array (用于 depth uint16 png)
+    s3_full_path: 完整的 S3 路径（不含 s3:// 前缀）
+    """
+    img_bytes = get_aoss_client().get_path2data(f"s3://{s3_full_path}")
+    img_arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    return cv2.imdecode(img_arr, cv2.IMREAD_UNCHANGED)
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 UINT16_MAX = 65535
 
@@ -65,7 +97,7 @@ def get_depth_anything_disp(
     ret_type: Literal["uint16", "float"] = "float",
 ):
 
-    image = Image.open(img_file)
+    image = aoss_read_image_pil(img_file)
     disp = pipe(image)["predicted_depth"]
     disp = torch.nn.functional.interpolate(
         disp.unsqueeze(1), size=image.size[::-1], mode="bicubic", align_corners=False
@@ -87,9 +119,7 @@ def save_disp_from_dir(
     matching_pattern: str = "*",
     step: int = 10,
 ):
-    img_files = sorted(glob(osp.join(img_dir, "*.jpg"))) + sorted(
-        glob(osp.join(img_dir, "*.png"))
-    )
+    img_files = aoss_list_images(img_dir)
     # print(img_files)
     img_files = [
         f for f in img_files if fnmatch.fnmatch(osp.basename(f), matching_pattern)
@@ -97,7 +127,11 @@ def save_disp_from_dir(
     # q_ts = list(range(0, len(img_files), step))
     # img_files = [img_files[q] for q in q_ts]
 
-    if osp.exists(out_dir) and len(glob(osp.join(out_dir, "*.png"))) == len(img_files):
+    # 检查 S3 上是否已经存在对应的 depth 输出
+    s3_out_dir = f"yanghongbo/ylr-data/P02/SAM_M/{out_dir}"
+    existing_files = get_aoss_client().get_Bucket_list(s3_out_dir) or []
+    existing_pngs = [f for f in existing_files if f.lower().endswith('.png')]
+    if len(existing_pngs) == len(img_files):
         print(f"Raw {model_name} depth maps already computed for {img_dir}")
         return
 
@@ -121,19 +155,26 @@ def align_monodepth_with_metric_depth(
     print(
         f"Aligning monodepth in {input_monodepth_dir} with metric depth in {metric_depth_dir}"
     )
-    mono_paths = sorted(glob(f"{input_monodepth_dir}/{matching_pattern}"))
+    s3_mono_dir = f"yanghongbo/ylr-data/P02/SAM_M/{input_monodepth_dir}"
+    mono_items = get_aoss_client().get_Bucket_list(s3_mono_dir) or []
+    mono_prefix = s3_mono_dir.rstrip('/') + '/'
+    mono_paths = sorted([mono_prefix + item for item in mono_items])
+    mono_paths = [p for p in mono_paths if fnmatch.fnmatch(osp.basename(p), matching_pattern)]
     img_files = [osp.basename(p) for p in mono_paths]
     os.makedirs(output_monodepth_dir, exist_ok=True)
-    if len(os.listdir(output_monodepth_dir)) == len(img_files):
-        print(f"Founds {len(img_files)} files in {output_monodepth_dir}, skipping")
+    # 检查 S3 上已对齐的输出数量
+    s3_out_check = f"yanghongbo/ylr-data/P02/SAM_M/{output_monodepth_dir}"
+    existing_out = get_aoss_client().get_Bucket_list(s3_out_check) or []
+    if len(existing_out) == len(img_files):
+        print(f"Founds {len(img_files)} files in {output_monodepth_dir} on S3, skipping")
         return
 
     for f in tqdm(img_files):
         imname = os.path.splitext(f)[0]
         metric_path = osp.join(metric_depth_dir, imname + ".npy")
         mono_path = osp.join(input_monodepth_dir, imname + ".png")
-
-        mono_disp_map = iio.imread(mono_path) / UINT16_MAX
+        s3_mono = f"yanghongbo/ylr-data/P02/SAM_M/{mono_path}"
+        mono_disp_map = aoss_read_image_raw(s3_mono) / UINT16_MAX
         metric_disp_map = np.load(metric_path)
         ms_colmap_disp = metric_disp_map - np.median(metric_disp_map) + 1e-8
         ms_mono_disp = mono_disp_map - np.median(mono_disp_map) + 1e-8
@@ -197,7 +238,8 @@ def align_monodepth_with_colmap(
         monodepth_path = osp.join(
             input_monodepth_dir, osp.splitext(image.name)[0] + ".png"
         )
-        mono_disp_map = iio.imread(monodepth_path) / UINT16_MAX
+        s3_monodepth = f"yanghongbo/ylr-data/P02/SAM_M/{monodepth_path}"
+        mono_disp_map = aoss_read_image_raw(s3_monodepth) / UINT16_MAX
 
         colmap_disp = 1.0 / np.clip(colmap_depth, a_min=1e-6, a_max=1e6)
         mono_disp = cv2.remap(

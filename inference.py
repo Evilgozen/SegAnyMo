@@ -36,6 +36,69 @@ def get_aoss_client():
         _aoss_client = AOSS_Client(AOSS_CONF_PATH, 'aoss')
     return _aoss_client
 
+
+def aoss_list_images(image_dir):
+    """从 AOSS 列举指定目录下的图片文件路径列表
+    get_Bucket_list 返回的是子项名称，需要和目录前缀拼接成完整路径
+    """
+    s3_dir = f"yanghongbo/ylr-data/P02/SAM_M/{image_dir}"
+    items = get_aoss_client().get_Bucket_list(s3_dir)
+    valid_exts = ('.png', '.jpg', '.jpeg')
+    prefix = s3_dir.rstrip('/') + '/'
+    paths = sorted([
+        prefix + item for item in items
+        if any(item.lower().endswith(ext) for ext in valid_exts)
+    ])
+    return paths
+
+
+def aoss_read_image_pil(s3_full_path):
+    """从 AOSS 读取图片并返回 PIL Image
+    s3_full_path: 完整的 S3 路径（不含 s3:// 前缀），如 yanghongbo/ylr-data/P02/SAM_M/xxx.png
+    """
+    img_bytes = get_aoss_client().get_path2data(f"s3://{s3_full_path}")
+    return Image.open(io.BytesIO(img_bytes))
+
+
+def aoss_read_npy(s3_full_path):
+    """从 AOSS 读取 npy 文件并返回 numpy array
+    s3_full_path: 完整的 S3 路径（不含 s3:// 前缀）
+    """
+    npy_bytes = get_aoss_client().get_path2data(f"s3://{s3_full_path}")
+    return np.load(io.BytesIO(npy_bytes))
+
+
+def aoss_read_imgs(img_dir):
+    """从 AOSS 读取图片目录，替代 read_imgs_from_path"""
+    img_paths = aoss_list_images(img_dir)
+    img_list = []
+    for path in img_paths:
+        pil_img = aoss_read_image_pil(path)
+        img = np.array(pil_img)
+        img_tensor = torch.from_numpy(img)
+        img_list.append(img_tensor)
+    imgs = torch.stack(img_list, dim=0).permute(0, 3, 1, 2).unsqueeze(0)
+    if imgs.shape[2] == 4:
+        imgs = imgs[:, :, :3, :, :]
+    return imgs
+
+
+def to_s3_path(local_path):
+    """将本地相对路径转为 S3 完整路径（不含 s3:// 前缀）"""
+    return f"yanghongbo/ylr-data/P02/SAM_M/{local_path}"
+
+
+def aoss_load_target_tracks(q_name, tracks_dir, num_frames, frame_names, dim=1):
+    """从 AOSS 读取 track npy 文件，替代 load_target_tracks"""
+    target_indices = range(num_frames)
+    all_tracks = []
+    for ti in target_indices:
+        t_name = frame_names[ti]
+        path = f"{tracks_dir}/{q_name}_{t_name}.npy"
+        tracks = aoss_read_npy(to_s3_path(path)).astype(np.float32)
+        all_tracks.append(tracks)
+    return torch.from_numpy(np.stack(all_tracks, axis=dim))
+
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 os.environ["TORCH_USE_CUDA_DSA"] = "1"
 torch.autograd.set_detect_anomaly(True)
@@ -49,18 +112,16 @@ def main(cfg):
     img_dir = cfg.imgs_dir
     depth_dir = cfg.depths_dir
 
-    imgs = read_imgs_from_path(img_dir)
+    imgs = aoss_read_imgs(img_dir)
 
-    depth_paths = sorted(glob(os.path.join(depth_dir, "*.png"))) + sorted(
-        glob(os.path.join(depth_dir, "*.jpg")) + sorted(glob(os.path.join(depth_dir, "*.jpeg")))
-    )
+    depth_paths = aoss_list_images(depth_dir)
     
     frame_names = [os.path.splitext(os.path.basename(p))[0] for p in depth_paths]
     num_frames = len(depth_paths)
     
     depth_list = []
     for path in depth_paths:
-        depth_img = np.array(Image.open(path).convert('L') )
+        depth_img = np.array(aoss_read_image_pil(path).convert('L'))
         depth_image_normalized = (depth_img - depth_img.min()) / (depth_img.max() - depth_img.min())
         depth_tensor = torch.from_numpy(depth_image_normalized)
         depth_list.append(depth_tensor)
@@ -87,8 +148,8 @@ def main(cfg):
         track_path = os.path.join(cfg.track_dir,"pred_tracks.npy")
         visible_path = track_path.replace('tracks','visibility')
         
-        track = torch.from_numpy(np.load(track_path)).permute(2,1,0).unsqueeze(0) # (200, 256, 2)
-        visible_mask = torch.from_numpy(np.load(visible_path)).permute(1,0)
+        track = torch.from_numpy(aoss_read_npy(to_s3_path(track_path))).permute(2,1,0).unsqueeze(0) # (200, 256, 2)
+        visible_mask = torch.from_numpy(aoss_read_npy(to_s3_path(visible_path))).permute(1,0)
         # confi_value, visib_value, confidences = 1, 1, 1
         q_t = 0
 
@@ -105,7 +166,7 @@ def main(cfg):
         dinos = []
         
         for q_t in q_ts:
-            tracks_2d = load_target_tracks(frame_names[q_t], tracks_dir, num_frames, frame_names)
+            tracks_2d = aoss_load_target_tracks(frame_names[q_t], tracks_dir, num_frames, frame_names)
             track_2d, occs, dists = (
                 tracks_2d[..., :2],
                 tracks_2d[..., 2],
@@ -135,16 +196,10 @@ def main(cfg):
                 gt_label = find_traj_label(sampled_track.permute(2,0,1).unsqueeze(0), ~sample_visibles.unsqueeze(0).unsqueeze(0), dynamic_mask, q_t)
                 traj_labels.append(gt_label)
             if cfg.dino:
-                # Load DINO feature
+                # Load DINO feature from AOSS
                 dino_dir = os.path.join(os.path.dirname(os.path.dirname(args.imgs_dir)), "dinos", os.path.basename(args.imgs_dir))
-                dino_paths = sorted(glob(os.path.join(dino_dir, "*.npy")))
-                if len(dino_paths)>0:
-                    dino_path = os.path.join(dino_dir,f'{frame_names[q_t]}.npy')
-                    features = np.load(dino_path)
-                else:
-                    dino_paths = sorted(glob(os.path.join(dino_dir, "*.h5")))
-                    with h5py.File(dino_paths[q_t], 'r') as hf:
-                        features = hf['dinos'][:]
+                dino_path = os.path.join(dino_dir, f'{frame_names[q_t]}.npy')
+                features = aoss_read_npy(to_s3_path(dino_path))
                 dino_list = torch.from_numpy(features).unsqueeze(0).unsqueeze(0)
                     
                 featmap_downscale_factor = (
@@ -290,10 +345,12 @@ def main(cfg):
         lock_path = doc_path + ".lock"
 
         with FileLock(lock_path):
-            if os.path.exists(doc_path):
-                with open(doc_path, 'r') as json_file:
-                    existing_data = json.load(json_file)
-            else:
+            # 尝试从 S3 读取已有的 iou.json
+            try:
+                s3_doc = f"{S3_BUCKET_PREFIX}/{doc_path}"
+                doc_bytes = get_aoss_client().get_path2data(s3_doc)
+                existing_data = json.loads(doc_bytes.decode('utf-8'))
+            except Exception:
                 existing_data = {}
             
             existing_data[seq_name] = cur_iou
@@ -312,11 +369,14 @@ def main(cfg):
         lock_roc_path = roc_file_path + ".lock"
 
         with FileLock(lock_roc_path):
-            if os.path.exists(roc_file_path):
-                with np.load(roc_file_path) as data:
+            # 尝试从 S3 读取已有的 res.npz
+            try:
+                s3_roc = f"{S3_BUCKET_PREFIX}/{roc_file_path}"
+                roc_bytes = get_aoss_client().get_path2data(s3_roc)
+                with np.load(io.BytesIO(roc_bytes)) as data:
                     all_preds = data['all_preds']
                     all_labels = data['all_labels']
-            else:
+            except Exception:
                 all_preds, all_labels = [], []
 
             new_pred = pred_np.flatten()
